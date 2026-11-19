@@ -1,7 +1,7 @@
 {
   "name": "grulode-backend",
-  "version": "1.0.0",
-  "description": "Backend temporal gratis para GRULODE (Node + Express + JWT, memoria)",
+  "version": "2.0.0",
+  "description": "Backend GRULODE conectado a Firestore",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,6 +9,6 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "jsonwebtoken": "^9.0.2"
+    "firebase-admin": "^12.0.0"
   }
 }
