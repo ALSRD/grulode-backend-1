@@ -1,223 +1,215 @@
 const express = require("express");
 const cors = require("cors");
-const jwt = require("jsonwebtoken");
+const admin = require("firebase-admin");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CLAVE SECRETA PARA FIRMAR JWT (CAMBIA ESTO!)
-const JWT_SECRET = process.env.JWT_SECRET || "CAMBIA-ESTA-CLAVE-POR-UNA-LARGA-Y-SEGURA";
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
+if (!serviceAccount.project_id) {
+  console.error("❌ Falta FIREBASE_SERVICE_ACCOUNT en las variables de entorno");
+  process.exit(1);
+}
+admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const db = admin.firestore();
 
-// Middleware
-app.use(cors());
+app.use(cors({ origin: true }));
 app.use(express.json());
 
-// ====== "BASE DE DATOS" EN MEMORIA ======
-const usuarios = [
-  {
-    id: "USR-001",
-    nombre: "Administrador GRULODE",
-    email: "admin@grulode.com",
-    password: "123456"
+async function verificarAdmin(req, res, next) {
+  try {
+    const auth = req.headers.authorization || "";
+    if (!auth.startsWith("Bearer ")) return res.status(401).json({ status: "error", message: "Token faltante" });
+    const decoded = await admin.auth().verifyIdToken(auth.substring(7));
+    const adminDoc = await db.collection("admins").doc(decoded.uid).get();
+    if (!adminDoc.exists) return res.status(403).json({ status: "error", message: "No eres administrador" });
+    req.adminUid = decoded.uid;
+    req.adminEmail = decoded.email;
+    next();
+  } catch (e) {
+    return res.status(401).json({ status: "error", message: "Token inválido: " + e.message });
   }
-];
-
-const billeteras = {
-  "USR-001": {
-    balance: 0,
-    moneda: "DOP",
-    movimientos: []
-  }
-};
-
-// ====== FUNCIONES AUXILIARES ======
-
-function crearToken(usuario) {
-  return jwt.sign(
-    {
-      sub: usuario.id,
-      email: usuario.email,
-      nombre: usuario.nombre
-    },
-    JWT_SECRET,
-    { expiresIn: "1d" }
-  );
 }
 
-function authMiddleware(req, res, next) {
-  const auth = req.headers.authorization || "";
-  if (!auth.startsWith("Bearer ")) {
-    return res.status(401).json({ status: "error", message: "Token inválido" });
+app.get("/", (req, res) => res.json({ status: "ok", mensaje: "Backend GRULODE activo" }));
+app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
+
+// ===== PROCESAR SOLICITUD =====
+app.post("/procesarSolicitud", verificarAdmin, async (req, res) => {
+  const { solicitudId, accion, comprobante, motivo } = req.body || {};
+  if (!solicitudId || !["aprobar", "rechazar"].includes(accion)) {
+    return res.status(400).json({ status: "error", message: "Datos incompletos" });
   }
+  try {
+    const result = await db.runTransaction(async (tx) => {
+      const solRef = db.collection("solicitudes").doc(solicitudId);
+      const solSnap = await tx.get(solRef);
+      if (!solSnap.exists) throw new Error("Solicitud no existe");
+      const sol = solSnap.data();
+      if (sol.status !== "pending") throw new Error("La solicitud ya fue procesada");
+
+      const uid = sol.uid || sol.userId || sol.user;
+      if (!uid) throw new Error("La solicitud no tiene uid de usuario");
+
+      const userRef = db.collection("usuarios").doc(String(uid));
+      const userSnap = await tx.get(userRef);
+      if (!userSnap.exists) throw new Error("Usuario no existe");
+      const user = userSnap.data();
+      const amount = Number(sol.amount || 0);
+
+      if (accion === "aprobar") {
+        if (sol.type === "deposit") {
+          tx.update(userRef, { balance: admin.firestore.FieldValue.increment(amount) });
+        } else if (sol.type === "withdraw") {
+          if (Number(user.balance || 0) < amount) throw new Error("Saldo insuficiente para pagar retiro");
+          tx.update(userRef, { balance: admin.firestore.FieldValue.increment(-amount) });
+        }
+        tx.update(solRef, {
+          status: "approved", approvedAt: new Date().toISOString(),
+          aprobadoPor: req.adminEmail, ...(comprobante ? { comprobante } : {})
+        });
+      } else {
+        tx.update(solRef, {
+          status: "rejected", rejectedAt: new Date().toISOString(),
+          motivoRechazo: motivo || "Sin motivo", aprobadoPor: req.adminEmail
+        });
+      }
+      return { type: sol.type, amount, uid };
+    });
+
+    await db.collection("audit_log").add({
+      accion: `${accion}_solicitud`, targetId: solicitudId,
+      adminEmail: req.adminEmail, adminUid: req.adminUid,
+      detalles: { ...result, comprobante, motivo }, createdAt: new Date().toISOString()
+    });
+    return res.json({ status: "ok", ...result });
+  } catch (e) {
+    return res.status(400).json({ status: "error", message: e.message });
+  }
+});
+
+// ===== PROCESAR SORTEO =====
+app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
+  const { loteria, numeros, fechaClave, adminEmail } = req.body || {};
+  if (!loteria || !Array.isArray(numeros) || numeros.length !== 3) {
+    return res.status(400).json({ status: "error", message: "Datos incompletos" });
+  }
+  const nums = numeros.map(n => String(n).padStart(2, "0"));
+  const fecha = fechaClave || new Date().toISOString().slice(0, 10);
 
   try {
-    const token = auth.substring(7);
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ status: "error", message: "Token expirado" });
-  }
-}
+    // 1. Pagar tickets normales (Q1, P12, T3) de esta lotería
+    const ticketsSnap = await db.collection("tickets")
+      .where("lot", "==", loteria).where("fechaClave", "==", fecha).get();
 
-// ====== RUTAS ======
+    let pagados = 0, totalPagado = 0;
+    const ganadores = [];
 
-app.get("/", (req, res) => {
-  res.json({ status: "ok", mensaje: "Backend GRULODE activo" });
-});
+    for (const ticketDoc of ticketsSnap.docs) {
+      const t = ticketDoc.data();
+      const items = Array.isArray(t.items) ? t.items : [];
+      let premioTicket = 0;
 
-// LOGIN
-app.post("/api/login", (req, res) => {
-  const { email, password } = req.body || {};
+      for (const it of items) {
+        const mode = it.mode;
+        const numsJugados = (it.nums || []).map(n => String(n).padStart(2, "0"));
+        const amt = Number(it.amt || 0);
+        let mult = 0;
 
-  const u = usuarios.find(
-    (x) =>
-      x.email.toLowerCase() === String(email).toLowerCase() &&
-      x.password === String(password)
-  );
+        if (mode === "Q1") {
+          const n = numsJugados[0];
+          if (n === nums[0]) mult = 60;
+          else if (n === nums[1]) mult = 8;
+          else if (n === nums[2]) mult = 4;
+        } else if (mode === "P12") {
+          if (numsJugados.length === 2 && numsJugados.every(n => nums.includes(n))) mult = 1000;
+        } else if (mode === "T3") {
+          if (numsJugados.length === 3 && numsJugados.slice().sort().join() === nums.slice().sort().join()) mult = 20000;
+        }
+        if (mult > 0) premioTicket += amt * mult;
+      }
 
-  if (!u) {
-    return res.status(401).json({
-      status: "error",
-      message: "Credenciales incorrectas"
-    });
-  }
-
-  const token = crearToken(u);
-
-  return res.json({
-    status: "ok",
-    token,
-    usuario: {
-      id: u.id,
-      nombre: u.nombre,
-      email: u.email
+      if (premioTicket > 0) {
+        const uid = t.uid || t.userId;
+        if (uid) await db.collection("usuarios").doc(String(uid)).update({
+          balance: admin.firestore.FieldValue.increment(premioTicket)
+        });
+        await ticketDoc.ref.update({ premio: premioTicket, status: "ganador", pagadoAt: new Date().toISOString() });
+        pagados++; totalPagado += premioTicket;
+        ganadores.push({ ticketId: ticketDoc.id, uid, premio: premioTicket });
+      } else {
+        await ticketDoc.ref.update({ premio: 0, status: "perdedor" });
+      }
     }
-  });
-});
 
-// BILLETERA
-app.get("/api/billetera", authMiddleware, (req, res) => {
-  const id = req.user.sub;
-  const w = billeteras[id];
-
-  res.json({
-    status: "ok",
-    balance: w.balance,
-    moneda: w.moneda,
-    movimientos: w.movimientos
-  });
-});
-
-// HISTORIAL
-app.get("/api/historial", authMiddleware, (req, res) => {
-  const id = req.user.sub;
-  res.json({
-    status: "ok",
-    movimientos: billeteras[id].movimientos
-  });
-});
-
-// JUGADA
-app.post("/api/jugadas", authMiddleware, (req, res) => {
-  const id = req.user.sub;
-  const { total, loteria_nombre, moneda } = req.body || {};
-
-  if (!total || !loteria_nombre || !moneda) {
-    return res.status(400).json({
-      status: "error",
-      message: "Datos incompletos"
+    // 2. Guardar este resultado para que el Super Palé lo pueda consultar después
+    await db.collection("resultados_globales").add({
+      loteria, numeros: nums, fechaClave: fecha,
+      createdAt: new Date().toISOString()
     });
-  }
 
-  const w = billeteras[id];
+    // 3. Resolver Super Palés pendientes que involucren esta lotería
+    const superSnap = await db.collection("tickets")
+      .where("fechaClave", "==", fecha).get();
 
-  if (w.balance < total) {
-    return res.status(400).json({
-      status: "error",
-      message: "Balance insuficiente"
+    let superPagados = 0, superTotal = 0;
+
+    for (const doc of superSnap.docs) {
+      const t = doc.data();
+      if (t.pagadoSuper) continue;
+      const items = Array.isArray(t.items) ? t.items : [];
+
+      for (const it of items) {
+        if (it.mode !== "SUPER") continue;
+
+        // Detectar campos de loterías y números de forma flexible
+        const lot1 = it.lot1 || it.loteria1 || it.lotA;
+        const lot2 = it.lot2 || it.loteria2 || it.lotB;
+        const numsIt = (it.nums || it.numeros || []).map(n => String(n).padStart(2, "0"));
+        const amt = Number(it.amt || it.monto || it.amount || 0);
+
+        if (!lot1 || !lot2 || numsIt.length !== 2 || amt <= 0) continue;
+
+        // Verificar si esta publicación corresponde a una de las dos loterías
+        let otraLot = null, numEsta = null, numOtra = null;
+        if (lot1 === loteria) { otraLot = lot2; numEsta = numsIt[0]; numOtra = numsIt[1]; }
+        else if (lot2 === loteria) { otraLot = lot1; numEsta = numsIt[1]; numOtra = numsIt[0]; }
+        else continue;
+
+        // Esta lotería debe tener el número en 1ra posición
+        if (numEsta !== nums[0]) continue;
+
+        // Buscar el resultado de la otra lotería
+        const otraSnap = await db.collection("resultados_globales")
+          .where("loteria", "==", otraLot).where("fechaClave", "==", fecha)
+          .orderBy("createdAt", "desc").limit(1).get();
+
+        if (otraSnap.empty) continue;
+        const otraRes = otraSnap.docs[0].data();
+
+        if (numOtra === String(otraRes.numeros[0]).padStart(2, "0")) {
+          const premio = amt * 3000;
+          const uid = t.uid || t.userId;
+          if (uid) await db.collection("usuarios").doc(String(uid)).update({
+            balance: admin.firestore.FieldValue.increment(premio)
+          });
+          await doc.ref.update({ pagadoSuper: true, premioSuper: premio, pagadoSuperAt: new Date().toISOString() });
+          superPagados++; superTotal += premio;
+        }
+      }
+    }
+
+    await db.collection("audit_log").add({
+      accion: "publicar_sorteo", targetId: loteria,
+      adminEmail: req.adminEmail, adminUid: req.adminUid,
+      detalles: { numeros: nums, fechaClave: fecha, pagados, totalPagado, superPagados, superTotal },
+      createdAt: new Date().toISOString()
     });
+
+    return res.json({ status: "ok", pagados, totalPagado, ganadores, superPagados, superTotal });
+  } catch (e) {
+    return res.status(400).json({ status: "error", message: e.message });
   }
-
-  w.balance -= total;
-  w.movimientos.push({
-    id: "MOV-" + Date.now(),
-    tipo: "apuesta",
-    monto: -total,
-    descripcion: "Apuesta – " + loteria_nombre,
-    fecha: new Date().toISOString()
-  });
-
-  res.json({ status: "ok", message: "Jugada registrada" });
 });
 
-// RECARGA
-app.post("/api/recarga", authMiddleware, (req, res) => {
-  const id = req.user.sub;
-  const { monto, metodo } = req.body || {};
-
-  if (!monto || !metodo) {
-    return res.status(400).json({
-      status: "error",
-      message: "Datos incompletos"
-    });
-  }
-
-  const w = billeteras[id];
-  w.balance += Number(monto);
-  w.movimientos.push({
-    id: "MOV-" + Date.now(),
-    tipo: "entrada",
-    monto: Number(monto),
-    descripcion: "Recarga – " + metodo,
-    fecha: new Date().toISOString()
-  });
-
-  res.json({ status: "ok", message: "Recarga registrada" });
-});
-
-// RETIRO
-app.post("/api/retiro", authMiddleware, (req, res) => {
-  const id = req.user.sub;
-  const { monto } = req.body || {};
-
-  if (!monto) {
-    return res.status(400).json({
-      status: "error",
-      message: "Monto requerido"
-    });
-  }
-
-  const w = billeteras[id];
-
-  if (w.balance < monto) {
-    return res.status(400).json({
-      status: "error",
-      message: "Balance insuficiente"
-    });
-  }
-
-  w.balance -= Number(monto);
-  w.movimientos.push({
-    id: "MOV-" + Date.now(),
-    tipo: "salida",
-    monto: -Number(monto),
-    descripcion: "Retiro solicitado",
-    fecha: new Date().toISOString()
-  });
-
-  res.json({ status: "ok", message: "Retiro registrado" });
-});
-
-// COMPROBANTE
-app.post("/api/comprobante", authMiddleware, (req, res) => {
-  res.json({
-    status: "ok",
-    message: "Comprobante recibido (backend temporal)"
-  });
-});
-
-// INICIAR SERVIDOR
-app.listen(PORT, () => {
-  console.log("Backend GRULODE activo en puerto " + PORT);
-});
+app.listen(PORT, () => console.log("✅ Backend GRULODE activo en puerto " + PORT));
