@@ -151,9 +151,10 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
       }
     }
 
-    // 2. Guardar este resultado para que el Super Palé lo pueda consultar después
+    // 2. Guardar este resultado para que el Super Palé y la web lo puedan consultar
+    // ✅ ARREGLO APLICADO AQUÍ: Se guarda como "nums" para que el index.html lo lea.
     await db.collection("resultados_globales").add({
-      loteria, numeros: nums, fechaClave: fecha,
+      loteria, nums: nums, fechaClave: fecha,
       createdAt: new Date().toISOString()
     });
 
@@ -196,7 +197,10 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
         if (otraSnap.empty) continue;
         const otraRes = otraSnap.docs[0].data();
 
-        if (numOtra === String(otraRes.numeros[0]).padStart(2, "0")) {
+        // ✅ CORRECCIÓN: Leer "nums[0]" en lugar de "numeros[0]" si es que el campo viejo estaba mal.
+        const otraNum = String(otraRes.nums ? otraRes.nums[0] : otraRes.numeros[0]).padStart(2, "0");
+
+        if (numOtra === otraNum) {
           const premio = amt * 3000;
           const uid = t.uid || t.userId;
           if (uid) await db.collection("usuarios").doc(String(uid)).update({
@@ -211,7 +215,7 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
     await db.collection("audit_log").add({
       accion: "publicar_sorteo", targetId: loteria,
       adminEmail: req.adminEmail, adminUid: req.adminUid,
-      detalles: { numeros: nums, fechaClave: fecha, pagados, totalPagado, superPagados, superTotal },
+      detalles: { nums: nums, fechaClave: fecha, pagados, totalPagado, superPagados, superTotal },
       createdAt: new Date().toISOString()
     });
 
