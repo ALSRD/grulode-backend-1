@@ -13,12 +13,24 @@ if (!serviceAccount.project_id) {
 }
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
-
-// Evitar errores con valores undefined en Firestore
 db.settings({ ignoreUndefinedProperties: true });
 
 app.use(cors({ origin: true }));
 app.use(express.json());
+
+// ====== CONFIG DING ======
+const DING_API_KEY = process.env.DING_API_KEY;
+const DING_BASE = "https://api.dingconnect.com";
+
+// ⚠️ IMPORTANTE: Reemplaza estos SKU con los reales de Ding (los obtienes con GetProducts)
+const SKU_MAP = {
+  CLARO: process.env.DING_SKU_CLARO || "",
+  ALTICE: process.env.DING_SKU_ALTICE || "",
+  VIVA: process.env.DING_SKU_VIVA || ""
+};
+
+// Tasa de conversión RD$ → USD para enviar a Ding (ajústala a tu criterio)
+const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60); // 60 RD$ = 1 USD
 
 async function verificarAdmin(req, res, next) {
   try {
@@ -29,6 +41,20 @@ async function verificarAdmin(req, res, next) {
     if (!adminDoc.exists) return res.status(403).json({ status: "error", message: "No eres administrador" });
     req.adminUid = decoded.uid;
     req.adminEmail = decoded.email;
+    next();
+  } catch (e) {
+    return res.status(401).json({ status: "error", message: "Token inválido: " + e.message });
+  }
+}
+
+// Verifica token de cualquier usuario (no solo admin) para la recarga
+async function verificarUsuario(req, res, next) {
+  try {
+    const auth = req.headers.authorization || "";
+    if (!auth.startsWith("Bearer ")) return res.status(401).json({ status: "error", message: "Token faltante" });
+    const decoded = await admin.auth().verifyIdToken(auth.substring(7));
+    req.uid = decoded.uid;
+    req.email = decoded.email;
     next();
   } catch (e) {
     return res.status(401).json({ status: "error", message: "Token inválido: " + e.message });
@@ -81,7 +107,6 @@ app.post("/procesarSolicitud", verificarAdmin, async (req, res) => {
       return { type: sol.type, amount, uid };
     });
 
-    // --- ARREGLO DEL ERROR UNDEFINED ---
     const detalles = { ...result };
     if (comprobante) detalles.comprobante = comprobante;
     if (motivo) detalles.motivo = motivo;
@@ -107,7 +132,6 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
   const fecha = fechaClave || new Date().toISOString().slice(0, 10);
 
   try {
-    // 1. Pagar tickets normales (Q1, P12, T3) de esta lotería
     const ticketsSnap = await db.collection("tickets")
       .where("lot", "==", loteria).where("fechaClave", "==", fecha).get();
 
@@ -151,14 +175,11 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
       }
     }
 
-    // 2. Guardar este resultado para que el Super Palé y la web lo puedan consultar
-    // ✅ ARREGLO APLICADO AQUÍ: Se guarda como "nums" para que el index.html lo lea.
     await db.collection("resultados_globales").add({
       loteria, nums: nums, fechaClave: fecha,
       createdAt: new Date().toISOString()
     });
 
-    // 3. Resolver Super Palés pendientes que involucren esta lotería
     const superSnap = await db.collection("tickets")
       .where("fechaClave", "==", fecha).get();
 
@@ -171,33 +192,25 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
 
       for (const it of items) {
         if (it.mode !== "SUPER") continue;
-
-        // Detectar campos de loterías y números de forma flexible
         const lot1 = it.lot1 || it.loteria1 || it.lotA;
         const lot2 = it.lot2 || it.loteria2 || it.lotB;
         const numsIt = (it.nums || it.numeros || []).map(n => String(n).padStart(2, "0"));
         const amt = Number(it.amt || it.monto || it.amount || 0);
-
         if (!lot1 || !lot2 || numsIt.length !== 2 || amt <= 0) continue;
 
-        // Verificar si esta publicación corresponde a una de las dos loterías
         let otraLot = null, numEsta = null, numOtra = null;
         if (lot1 === loteria) { otraLot = lot2; numEsta = numsIt[0]; numOtra = numsIt[1]; }
         else if (lot2 === loteria) { otraLot = lot1; numEsta = numsIt[1]; numOtra = numsIt[0]; }
         else continue;
 
-        // Esta lotería debe tener el número en 1ra posición
         if (numEsta !== nums[0]) continue;
 
-        // Buscar el resultado de la otra lotería
         const otraSnap = await db.collection("resultados_globales")
           .where("loteria", "==", otraLot).where("fechaClave", "==", fecha)
           .orderBy("createdAt", "desc").limit(1).get();
 
         if (otraSnap.empty) continue;
         const otraRes = otraSnap.docs[0].data();
-
-        // ✅ CORRECCIÓN: Leer "nums[0]" en lugar de "numeros[0]" si es que el campo viejo estaba mal.
         const otraNum = String(otraRes.nums ? otraRes.nums[0] : otraRes.numeros[0]).padStart(2, "0");
 
         if (numOtra === otraNum) {
@@ -222,6 +235,105 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
     return res.json({ status: "ok", pagados, totalPagado, ganadores, superPagados, superTotal });
   } catch (e) {
     return res.status(400).json({ status: "error", message: e.message });
+  }
+});
+
+// ============================================================
+// ===== NUEVA RUTA: RECARGA TELEFÓNICA CON DING =====
+// ============================================================
+app.post("/api/recargar", verificarUsuario, async (req, res) => {
+  const { compania, telefono, monto } = req.body || {};
+
+  // Validaciones básicas
+  if (!DING_API_KEY) {
+    return res.status(500).json({ status: "error", message: "DING_API_KEY no configurada en el servidor" });
+  }
+  if (!compania || !SKU_MAP[compania]) {
+    return res.status(400).json({ status: "error", message: "Compañía inválida o sin SKU configurado" });
+  }
+  if (!/^\d{10}$/.test(String(telefono || ""))) {
+    return res.status(400).json({ status: "error", message: "Teléfono inválido (10 dígitos)" });
+  }
+  const montoRD = Number(monto);
+  if (!montoRD || montoRD < 50) {
+    return res.status(400).json({ status: "error", message: "Monto mínimo RD$50" });
+  }
+
+  const uid = req.uid;
+  const userRef = db.collection("usuarios").doc(String(uid));
+
+  try {
+    // 1) Verificar saldo y descontar de forma atómica
+    await db.runTransaction(async (tx) => {
+      const uSnap = await tx.get(userRef);
+      if (!uSnap.exists) throw new Error("Usuario no existe");
+      const bal = Number(uSnap.data().balance || 0);
+      if (bal < montoRD) throw new Error("Saldo insuficiente");
+      tx.update(userRef, { balance: admin.firestore.FieldValue.increment(-montoRD) });
+    });
+
+    // 2) Crear registro de recarga en estado "procesando"
+    const recargaRef = db.collection("recargas_telefonicas").doc();
+    await recargaRef.set({
+      uid, nombreJugador: (await userRef.get()).data().nombre || "",
+      telefono: String(telefono), compania,
+      amount: montoRD, status: "procesando",
+      createdAt: new Date().toISOString(),
+      dingTransferRef: null, dingStatus: null, motivoRechazo: null
+    });
+
+    // 3) Llamar a Ding SendTransfer
+    // Convertimos RD$ a USD (Ding usa USD en tu cuenta)
+    const sendValueUSD = +(montoRD / TASA_RD_USD).toFixed(2);
+
+    const dingResp = await fetch(`${DING_BASE}/api/V1/SendTransfer`, {
+      method: "POST",
+      headers: {
+        "api_key": DING_API_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        SkuCode: SKU_MAP[compania],
+        SendValue: sendValueUSD,
+        SendCurrencyIso: "USD",
+        AccountNumber: String(telefono),
+        DistributorRef: recargaRef.id
+      })
+    });
+
+    const data = await dingResp.json();
+    const transfer = data.Transfers && data.Transfers[0];
+    const dingStatus = transfer?.TransferStatus || null;
+    const ok = dingStatus === "Complete" || dingStatus === "Submitted";
+
+    if (ok) {
+      await recargaRef.update({
+        status: "approved",
+        dingTransferRef: transfer?.TransferRef || null,
+        dingStatus: dingStatus,
+        approvedAt: new Date().toISOString(),
+        sendValueUSD
+      });
+      return res.json({ status: "ok", ok: true, dingStatus, transferRef: transfer?.TransferRef || null });
+    } else {
+      // Reembolsar al usuario
+      await userRef.update({ balance: admin.firestore.FieldValue.increment(montoRD) });
+      const motivo = transfer?.Receipt?.ErrorText || data.Message || "Ding rechazó la recarga";
+      await recargaRef.update({
+        status: "rejected",
+        dingStatus: dingStatus,
+        motivoRechazo: motivo,
+        rejectedAt: new Date().toISOString(),
+        sendValueUSD
+      });
+      return res.status(400).json({ status: "error", ok: false, message: motivo, dingStatus });
+    }
+  } catch (e) {
+    // Si falló antes de llamar a Ding, reembolsar
+    try {
+      await userRef.update({ balance: admin.firestore.FieldValue.increment(montoRD) });
+    } catch (_) {}
+    return res.status(400).json({ status: "error", ok: false, message: e.message });
   }
 });
 
