@@ -22,13 +22,30 @@ app.use(express.json());
 const DING_API_KEY = process.env.DING_API_KEY;
 const DING_BASE = "https://api.dingconnect.com";
 
+// MAPEO DE SKU POR COMPAÑÍA Y MONTO
 const SKU_MAP = {
-  CLARO: process.env.DING_SKU_CLARO || "",
-  ALTICE: process.env.DING_SKU_ALTICE || "",
-  VIVA: process.env.DING_SKU_VIVA || ""
+  CLARO: {
+    50: "SKU_CLARO_50",     // <-- Reemplazar cuando tengamos el código
+    100: "SKU_CLARO_100",   // <-- Reemplazar cuando tengamos el código
+    200: "SKU_CLARO_200"    // <-- Reemplazar cuando tengamos el código
+  },
+  ALTICE: {
+    50: "SKU_ALTICE_50",    // <-- Reemplazar cuando tengamos el código
+    100: "SKU_ALTICE_100",  // <-- Reemplazar cuando tengamos el código
+    200: "SKU_ALTICE_200"   // <-- Reemplazar cuando tengamos el código
+  },
+  VIVA: {
+    50: "9VDOD063871",      // Código real de tu foto
+    90: "9VDOD021227",      // Código real de tu foto
+    150: "9VDOD069794",     // Código real de tu foto
+    190: "9VDOD07320",      // Código real de tu foto
+    205: "9VDOD026094",     // Código real de tu foto
+    300: "9VDOD018191",     // Código real de tu foto
+    595: "9VDOD038454"      // Código real de tu foto
+  }
 };
 
-const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60);
+const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60); // Tasa de cambio (ajústala)
 
 async function verificarAdmin(req, res, next) {
   try {
@@ -61,7 +78,7 @@ async function verificarUsuario(req, res, next) {
 app.get("/", (req, res) => res.json({ status: "ok", mensaje: "Backend GRULODE activo" }));
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
 
-// ===== NUEVA RUTA TEMPORAL PARA VER PRODUCTOS DE DING =====
+// ===== RUTA TEMPORAL PARA VER PRODUCTOS =====
 app.get("/api/productos", async (req, res) => {
   try {
     const response = await fetch("https://api.dingconnect.com/api/V1/GetProducts?CountryIsos=DO", {
@@ -249,21 +266,27 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
 });
 
 // ============================================================
-// ===== NUEVA RUTA: RECARGA TELEFÓNICA CON DING =====
+// ===== RUTA: RECARGA TELEFÓNICA CON DING =====
 // ============================================================
 app.post("/api/recargar", verificarUsuario, async (req, res) => {
   const { compania, telefono, monto } = req.body || {};
+  const montoRD = Number(monto);
 
   if (!DING_API_KEY) {
     return res.status(500).json({ status: "error", message: "DING_API_KEY no configurada en el servidor" });
   }
-  if (!compania || !SKU_MAP[compania]) {
-    return res.status(400).json({ status: "error", message: "Compañía inválida o sin SKU configurado" });
+  
+  // Validar si la compañía y el monto tienen un SKU asignado
+  const skuFinal = SKU_MAP[compania] ? SKU_MAP[compania][montoRD] : null;
+
+  if (!compania || !skuFinal) {
+    return res.status(400).json({ status: "error", message: "Compañía o monto inválido (sin SKU configurado para ese monto)" });
   }
+  
   if (!/^\d{10}$/.test(String(telefono || ""))) {
     return res.status(400).json({ status: "error", message: "Teléfono inválido (10 dígitos)" });
   }
-  const montoRD = Number(monto);
+  
   if (!montoRD || montoRD < 50) {
     return res.status(400).json({ status: "error", message: "Monto mínimo RD$50" });
   }
@@ -298,7 +321,7 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        SkuCode: SKU_MAP[compania],
+        SkuCode: skuFinal, // AQUÍ USAMOS EL SKU DETECTADO
         SendValue: sendValueUSD,
         SendCurrencyIso: "USD",
         AccountNumber: String(telefono),
