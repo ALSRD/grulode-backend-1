@@ -22,20 +22,15 @@ app.use(express.json());
 const DING_API_KEY = process.env.DING_API_KEY;
 const DING_BASE = "https://api.dingconnect.com";
 
-// MAPEO DE SKU POR COMPAÑÍA
+// Mapeo de SKUs. He puesto un ejemplo de 300 pesos para cada compañía.
 const SKU_MAP = {
-  CLARO: "DO_CL_TopUp",       // Claro usa un código dinámico
-  ALTICE: "D8DODO53982",      // Altice: OJO, este es un paquete de 30 días. (Si falla, es porque no hay TopUp libre)
-  VIVA: "DO_VV_TopUp",        // Viva libre dinámico
-  VIVA_PAQUETES: {            // Viva por montos (si usas los botones de 50, 100, 200)
-    50: "9VDOD063871",
-    100: "9VDOD021227",
-    200: "9VDOD069794",
-    300: "9VDOD018191"
-  }
+  CLARO: process.env.DING_SKU_CLARO || "2CDOD018181", 
+  ALTICE: process.env.DING_SKU_ALTICE || "3ADOD018163",
+  VIVA: process.env.DING_SKU_VIVA || "9VDOD018191"
 };
 
-const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60); // Tasa de cambio (ajústala a tu criterio)
+// Tasa de conversión RD$ → USD para enviar a Ding (ajústala a tu criterio)
+const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60); // 60 RD$ = 1 USD
 
 async function verificarAdmin(req, res, next) {
   try {
@@ -52,6 +47,7 @@ async function verificarAdmin(req, res, next) {
   }
 }
 
+// Verifica token de cualquier usuario
 async function verificarUsuario(req, res, next) {
   try {
     const auth = req.headers.authorization || "";
@@ -68,7 +64,7 @@ async function verificarUsuario(req, res, next) {
 app.get("/", (req, res) => res.json({ status: "ok", mensaje: "Backend GRULODE activo" }));
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
 
-// ===== RUTA TEMPORAL PARA VER PRODUCTOS =====
+// Ruta TEMPORAL para ver los productos de Ding
 app.get("/api/productos", async (req, res) => {
   try {
     const response = await fetch("https://api.dingconnect.com/api/V1/GetProducts?CountryIsos=DO", {
@@ -256,35 +252,22 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
 });
 
 // ============================================================
-// ===== RUTA: RECARGA TELEFÓNICA CON DING =====
+// ===== NUEVA RUTA: RECARGA TELEFÓNICA CON DING =====
 // ============================================================
 app.post("/api/recargar", verificarUsuario, async (req, res) => {
   const { compania, telefono, monto } = req.body || {};
-  const montoRD = Number(monto);
 
+  // Validaciones básicas
   if (!DING_API_KEY) {
     return res.status(500).json({ status: "error", message: "DING_API_KEY no configurada en el servidor" });
   }
-  
-  // Lógica para elegir el SKU correcto
-  let skuFinal = null;
-  if (compania === "CLARO") {
-    skuFinal = SKU_MAP.CLARO;
-  } else if (compania === "ALTICE") {
-    skuFinal = SKU_MAP.ALTICE;
-  } else if (compania === "VIVA") {
-    // Si usas el TopUp libre de Viva o los paquetes específicos
-    skuFinal = SKU_MAP.VIVA_PAQUETES[montoRD] || SKU_MAP.VIVA;
+  if (!compania || !SKU_MAP[compania]) {
+    return res.status(400).json({ status: "error", message: "Compañía inválida o sin SKU configurado" });
   }
-
-  if (!compania || !skuFinal) {
-    return res.status(400).json({ status: "error", message: "Compañía o monto inválido (sin SKU configurado)" });
+  if (!/^\d{10,11}$/.test(String(telefono || ""))) {
+    return res.status(400).json({ status: "error", message: "Teléfono inválido (10 u 11 dígitos)" });
   }
-  
-  if (!/^\d{10}$/.test(String(telefono || ""))) {
-    return res.status(400).json({ status: "error", message: "Teléfono inválido (10 dígitos)" });
-  }
-  
+  const montoRD = Number(monto);
   if (!montoRD || montoRD < 50) {
     return res.status(400).json({ status: "error", message: "Monto mínimo RD$50" });
   }
@@ -293,6 +276,7 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
   const userRef = db.collection("usuarios").doc(String(uid));
 
   try {
+    // 1) Verificar saldo y descontar de forma atómica
     await db.runTransaction(async (tx) => {
       const uSnap = await tx.get(userRef);
       if (!uSnap.exists) throw new Error("Usuario no existe");
@@ -301,6 +285,7 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
       tx.update(userRef, { balance: admin.firestore.FieldValue.increment(-montoRD) });
     });
 
+    // 2) Crear registro de recarga en estado "procesando"
     const recargaRef = db.collection("recargas_telefonicas").doc();
     await recargaRef.set({
       uid, nombreJugador: (await userRef.get()).data().nombre || "",
@@ -310,7 +295,7 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
       dingTransferRef: null, dingStatus: null, motivoRechazo: null
     });
 
-    // Convertimos el monto a USD con la tasa configurada
+    // 3) Llamar a Ding SendTransfer
     const sendValueUSD = +(montoRD / TASA_RD_USD).toFixed(2);
 
     const dingResp = await fetch(`${DING_BASE}/api/V1/SendTransfer`, {
@@ -320,7 +305,7 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        SkuCode: skuFinal,
+        SkuCode: SKU_MAP[compania],
         SendValue: sendValueUSD,
         SendCurrencyIso: "USD",
         AccountNumber: String(telefono),
