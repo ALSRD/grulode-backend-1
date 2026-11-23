@@ -22,30 +22,20 @@ app.use(express.json());
 const DING_API_KEY = process.env.DING_API_KEY;
 const DING_BASE = "https://api.dingconnect.com";
 
-// MAPEO DE SKU POR COMPAÑÍA Y MONTO
+// MAPEO DE SKU POR COMPAÑÍA
 const SKU_MAP = {
-  CLARO: {
-    50: "SKU_CLARO_50",     // <-- Reemplazar cuando tengamos el código
-    100: "SKU_CLARO_100",   // <-- Reemplazar cuando tengamos el código
-    200: "SKU_CLARO_200"    // <-- Reemplazar cuando tengamos el código
-  },
-  ALTICE: {
-    50: "SKU_ALTICE_50",    // <-- Reemplazar cuando tengamos el código
-    100: "SKU_ALTICE_100",  // <-- Reemplazar cuando tengamos el código
-    200: "SKU_ALTICE_200"   // <-- Reemplazar cuando tengamos el código
-  },
-  VIVA: {
-    50: "9VDOD063871",      // Código real de tu foto
-    90: "9VDOD021227",      // Código real de tu foto
-    150: "9VDOD069794",     // Código real de tu foto
-    190: "9VDOD07320",      // Código real de tu foto
-    205: "9VDOD026094",     // Código real de tu foto
-    300: "9VDOD018191",     // Código real de tu foto
-    595: "9VDOD038454"      // Código real de tu foto
+  CLARO: "DO_CL_TopUp",       // Claro usa un código dinámico
+  ALTICE: "D8DODO53982",      // Altice: OJO, este es un paquete de 30 días. (Si falla, es porque no hay TopUp libre)
+  VIVA: "DO_VV_TopUp",        // Viva libre dinámico
+  VIVA_PAQUETES: {            // Viva por montos (si usas los botones de 50, 100, 200)
+    50: "9VDOD063871",
+    100: "9VDOD021227",
+    200: "9VDOD069794",
+    300: "9VDOD018191"
   }
 };
 
-const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60); // Tasa de cambio (ajústala)
+const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60); // Tasa de cambio (ajústala a tu criterio)
 
 async function verificarAdmin(req, res, next) {
   try {
@@ -276,11 +266,19 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
     return res.status(500).json({ status: "error", message: "DING_API_KEY no configurada en el servidor" });
   }
   
-  // Validar si la compañía y el monto tienen un SKU asignado
-  const skuFinal = SKU_MAP[compania] ? SKU_MAP[compania][montoRD] : null;
+  // Lógica para elegir el SKU correcto
+  let skuFinal = null;
+  if (compania === "CLARO") {
+    skuFinal = SKU_MAP.CLARO;
+  } else if (compania === "ALTICE") {
+    skuFinal = SKU_MAP.ALTICE;
+  } else if (compania === "VIVA") {
+    // Si usas el TopUp libre de Viva o los paquetes específicos
+    skuFinal = SKU_MAP.VIVA_PAQUETES[montoRD] || SKU_MAP.VIVA;
+  }
 
   if (!compania || !skuFinal) {
-    return res.status(400).json({ status: "error", message: "Compañía o monto inválido (sin SKU configurado para ese monto)" });
+    return res.status(400).json({ status: "error", message: "Compañía o monto inválido (sin SKU configurado)" });
   }
   
   if (!/^\d{10}$/.test(String(telefono || ""))) {
@@ -312,6 +310,7 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
       dingTransferRef: null, dingStatus: null, motivoRechazo: null
     });
 
+    // Convertimos el monto a USD con la tasa configurada
     const sendValueUSD = +(montoRD / TASA_RD_USD).toFixed(2);
 
     const dingResp = await fetch(`${DING_BASE}/api/V1/SendTransfer`, {
@@ -321,7 +320,7 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        SkuCode: skuFinal, // AQUÍ USAMOS EL SKU DETECTADO
+        SkuCode: skuFinal,
         SendValue: sendValueUSD,
         SendCurrencyIso: "USD",
         AccountNumber: String(telefono),
