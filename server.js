@@ -22,15 +22,13 @@ app.use(express.json());
 const DING_API_KEY = process.env.DING_API_KEY;
 const DING_BASE = "https://api.dingconnect.com";
 
-// ⚠️ IMPORTANTE: Reemplaza estos SKU con los reales de Ding (los obtienes con GetProducts)
 const SKU_MAP = {
   CLARO: process.env.DING_SKU_CLARO || "",
   ALTICE: process.env.DING_SKU_ALTICE || "",
   VIVA: process.env.DING_SKU_VIVA || ""
 };
 
-// Tasa de conversión RD$ → USD para enviar a Ding (ajústala a tu criterio)
-const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60); // 60 RD$ = 1 USD
+const TASA_RD_USD = Number(process.env.TASA_RD_USD || 60);
 
 async function verificarAdmin(req, res, next) {
   try {
@@ -47,7 +45,6 @@ async function verificarAdmin(req, res, next) {
   }
 }
 
-// Verifica token de cualquier usuario (no solo admin) para la recarga
 async function verificarUsuario(req, res, next) {
   try {
     const auth = req.headers.authorization || "";
@@ -63,6 +60,19 @@ async function verificarUsuario(req, res, next) {
 
 app.get("/", (req, res) => res.json({ status: "ok", mensaje: "Backend GRULODE activo" }));
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
+
+// ===== NUEVA RUTA TEMPORAL PARA VER PRODUCTOS DE DING =====
+app.get("/api/productos", async (req, res) => {
+  try {
+    const response = await fetch("https://api.dingconnect.com/api/V1/GetProducts?CountryIsos=DO", {
+      headers: { "api_key": process.env.DING_API_KEY }
+    });
+    const data = await response.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ===== PROCESAR SOLICITUD =====
 app.post("/procesarSolicitud", verificarAdmin, async (req, res) => {
@@ -244,7 +254,6 @@ app.post("/procesarSorteo", verificarAdmin, async (req, res) => {
 app.post("/api/recargar", verificarUsuario, async (req, res) => {
   const { compania, telefono, monto } = req.body || {};
 
-  // Validaciones básicas
   if (!DING_API_KEY) {
     return res.status(500).json({ status: "error", message: "DING_API_KEY no configurada en el servidor" });
   }
@@ -263,7 +272,6 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
   const userRef = db.collection("usuarios").doc(String(uid));
 
   try {
-    // 1) Verificar saldo y descontar de forma atómica
     await db.runTransaction(async (tx) => {
       const uSnap = await tx.get(userRef);
       if (!uSnap.exists) throw new Error("Usuario no existe");
@@ -272,7 +280,6 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
       tx.update(userRef, { balance: admin.firestore.FieldValue.increment(-montoRD) });
     });
 
-    // 2) Crear registro de recarga en estado "procesando"
     const recargaRef = db.collection("recargas_telefonicas").doc();
     await recargaRef.set({
       uid, nombreJugador: (await userRef.get()).data().nombre || "",
@@ -282,8 +289,6 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
       dingTransferRef: null, dingStatus: null, motivoRechazo: null
     });
 
-    // 3) Llamar a Ding SendTransfer
-    // Convertimos RD$ a USD (Ding usa USD en tu cuenta)
     const sendValueUSD = +(montoRD / TASA_RD_USD).toFixed(2);
 
     const dingResp = await fetch(`${DING_BASE}/api/V1/SendTransfer`, {
@@ -316,7 +321,6 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
       });
       return res.json({ status: "ok", ok: true, dingStatus, transferRef: transfer?.TransferRef || null });
     } else {
-      // Reembolsar al usuario
       await userRef.update({ balance: admin.firestore.FieldValue.increment(montoRD) });
       const motivo = transfer?.Receipt?.ErrorText || data.Message || "Ding rechazó la recarga";
       await recargaRef.update({
@@ -329,7 +333,6 @@ app.post("/api/recargar", verificarUsuario, async (req, res) => {
       return res.status(400).json({ status: "error", ok: false, message: motivo, dingStatus });
     }
   } catch (e) {
-    // Si falló antes de llamar a Ding, reembolsar
     try {
       await userRef.update({ balance: admin.firestore.FieldValue.increment(montoRD) });
     } catch (_) {}
